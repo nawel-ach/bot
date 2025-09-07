@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IMOBOT v3.0 – AI Spare Parts Assistant</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="static/css/style.css">
+</head>
+<body>
+    <!-- Animated Background Particles -->
+    <div class="bg-particles" id="bgParticles"></div>
+
+    <!-- Floating Chat Widget Button -->
+    <div class="chat-widget-btn pulse" id="chatWidgetBtn">
+        <i class="fas fa-robot"></i>
+    </div>
+
+    <!-- Chat Widget Window -->
+    <div class="chat-widget-window" id="chatWidgetWindow">
+        <!-- Chat Header -->
+        <div class="chat-widget-header">
+            <h3>
+                <i class="fas fa-robot"></i>
+                IMOBOT v3.0
+                <div class="status-dot"></div>
+            </h3>
+            <div class="chat-widget-actions">
+                <i class="fas fa-expand action-btn" id="chatResizeBtn" title="Maximize"></i>
+                <i class="fas fa-times action-btn" id="chatCloseBtn" title="Close"></i>
+            </div>
+        </div>
+
+        <!-- Chat Container -->
+        <div class="chat-container">
+            <div id="messages" class="messages"></div>
+            
+            <!-- Chat Input -->
+            <div class="chat-input">
+                <div class="input-container">
+                    <div class="input-wrapper">
+                        <textarea 
+                            id="messageInput" 
+                            class="chat-textarea"
+                            placeholder="Ask me about spare parts, track orders, or run commands..."
+                            rows="1"
+                        ></textarea>
+                        <i class="fas fa-pen input-icon"></i>
+                    </div>
+                    <button id="sendBtn" class="send-btn">
+                        <i class="fas fa-paper-plane"></i>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="static/js/script.js"></script>
+
+</body>
+</html>
