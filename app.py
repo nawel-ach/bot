@@ -100,11 +100,25 @@ def init_db():
                     reference VARCHAR(100),
                     user_phone VARCHAR(20),
                     user_email VARCHAR(100),
+                    found BOOLEAN DEFAULT FALSE,   -- ✅ new column
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-
+            
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 
+                        FROM information_schema.columns 
+                        WHERE table_name='conversations' 
+                        AND column_name='found'
+                    ) THEN
+                        ALTER TABLE conversations ADD COLUMN found BOOLEAN DEFAULT FALSE;
+                    END IF;
+                END$$;
+            """)
             # Create messages table referencing conversation_id
             cur.execute('''
                 CREATE TABLE IF NOT EXISTS messages (
@@ -155,8 +169,8 @@ def save_conversation_data(session):
         cur.execute('''
             INSERT INTO conversations (
                 conversation_id, session_id, brand, model, year,
-                spare_part_name, reference, user_phone, user_email
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                spare_part_name, reference, user_phone, user_email, found
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (conversation_id) DO UPDATE SET
                 brand = EXCLUDED.brand,
                 model = EXCLUDED.model,
@@ -165,6 +179,7 @@ def save_conversation_data(session):
                 reference = EXCLUDED.reference,
                 user_phone = EXCLUDED.user_phone,
                 user_email = EXCLUDED.user_email,
+                found = EXCLUDED.found,
                 updated_at = CURRENT_TIMESTAMP
         ''', (
             session['conversation_id'],
@@ -175,7 +190,8 @@ def save_conversation_data(session):
             session.get('spare_part'),
             session.get('reference'),
             session.get('user_phone'),
-            session.get('user_email')
+            session.get('user_email'),
+            session.get('found', False)   # ✅ Save found status
         ))
         conn.commit()
         return True
@@ -186,6 +202,7 @@ def save_conversation_data(session):
     finally:
         cur.close()
         conn.close()
+
 
 def save_message(conversation_id, role, content):
     """Save message to database"""
@@ -374,42 +391,7 @@ def validate_and_correct_spare_part(user_input):
     return 'SUGGESTION', user_input.title()
 
 
-def get_reference_details(reference, brand, model):
-    """Use DeepSeek to get detailed information about a reference number"""
-    prompt = f"""
-    Given:
-    - Reference/Part Number: {reference}
-    - Vehicle Brand: {brand}
-    - Vehicle Model: {model}
-    
-    Task: Provide details about this automotive part reference.
-    If you recognize this reference pattern, identify what type of part it typically represents.
-    
-    Provide in format:
-    PART_TYPE|part_name|description
-    
-    If unknown, respond:
-    UNKNOWN|generic_part|Part reference {reference} for {brand} {model}
-    
-    Use your knowledge of common OEM part numbering systems.
-    """
-    
-    result = call_deepseek_api(prompt, max_tokens=100)
-    
-    if result and '|' in result:
-        parts = result.split('|')
-        if len(parts) >= 3:
-            return {
-                'type': parts[0],
-                'name': parts[1],
-                'description': parts[2]
-            }
-    
-    return {
-        'type': 'UNKNOWN',
-        'name': 'Spare Part',
-        'description': f'Reference: {reference}'
-    }
+
 
 
 def search_products(brand=None, model=None, spare_part=None, reference=None):
@@ -452,89 +434,103 @@ def search_products(brand=None, model=None, spare_part=None, reference=None):
         cur.close()
         conn.close()
         
+spare_part_assistant_prompt = """
+Role: You are a "Spare Part Cross-Reference Expert", a specialized AI that identifies spare parts and finds their equivalent references across different manufacturers.
+
+Core Function: When provided a single part number, you must perform a two-step analysis:
+1.  **Identification:** Determine the exact common name, manufacturer, and function of the provided part number.
+2.  **Cross-Referencing:** Find the most common equivalent part numbers from other major manufacturers.
+
+Process & Rules:
+- **Accuracy Over Guesswork:** If a number is ambiguous or you have low confidence, you MUST state this clearly. Do not hallucinate information.
+- **Focus on Major Brands:** Prioritize equivalents from top OEM and aftermarket brands (e.g., Bosch, Mann-Filter, Mahle, Gates, NGK, Lemförder, Corteco, SKF, Febi Bilstein).
+- **Hierarchical Lookup:** First, identify the part. Then, find its direct equivalents. If a direct equivalent isn't known, you may list parts that are functionally equivalent for the same application.
+- **Supersession:** Always check if the provided number has been superseded by a newer number from the same manufacturer and note it.
+
+Input Format: The user will provide input as: [part number]
+Example: 0 242 235 653 or A0004209900
+
+Output Format: You MUST respond using the following exact markdown template. Do not deviate.
+
+### Identification
+- **Provided Reference:** [Input Number]
+- **Manufacturer:** [Primary Manufacturer]
+- **Part Name:** [Common Name]
+- **Description:** [One-sentence function description]
+- **Common Application:** [E.g., "VW Golf Mk7 1.8T TSI", "BMW E90 330i"]
+- **Note:** [Supersession or ambiguity note]
+
+### Common Equivalent References
+| Manufacturer | Part Number | Note |
+| :--- | :--- | :--- |
+| [Manufacturer Name] | [Equivalent Number] | [e.g., "Direct OEM equivalent"] |
+| [Manufacturer Name] | [Equivalent Number] | [e.g., "Aftermarket equivalent"] |
+| [Manufacturer Name] | [Equivalent Number] | [e.g., "Supersedes the provided number"] |
+
+**Disclaimer:** *These cross-references are for informational purposes only. Always verify part number compatibility with a professional before purchase.*
+
+Error Handling:
+- If the number is invalid: "Error: Could not identify a part for reference [number]. Please verify the number for typos."
+- If input is unclear: "Error: Input is ambiguous. Please specify the manufacturer or product category (e.g., 'automotive brake pad')."
+
+Now, analyze the following part number:
+"""
 
 def deepseek_reference_lookup(reference: str, brand: str = "", model: str = ""):
     """
-    Strict DeepSeek lookup for a part reference.
-    Returns a dict: {status: 'PART'|'UNKNOWN', part: str, description: str, confidence: int}
+    Uses strict spare part assistant prompt to identify and cross-reference a part number.
+    Returns structured dict.
     """
-    # sanitize brand/model (avoid passing tuples or weird values into prompt)
-    brand = (brand[1] if isinstance(brand, (list, tuple)) and len(brand) > 1 else str(brand or "")).strip()
-    model = (model[1] if isinstance(model, (list, tuple)) and len(model) > 1 else str(model or "")).strip()
+    prompt = spare_part_assistant_prompt + f"\n{reference}\n"
 
-    prompt = f"""
-You are an automotive spare parts catalog expert. The user provided an OEM reference: "{reference}".
-Task:
-- If you know the exact part this OEM reference maps to, respond in ONE LINE, EXACTLY in this format (no extra text or explanation):
-  PART|<part_name>|<short_description>|CONFIDENCE|<0-100>
-  Example:
-  PART|Front Brake Pads|Front brake pads for BMW front axle|CONFIDENCE|95
+    raw = call_deepseek_api(prompt, max_tokens=400)
+    if not raw:
+        return {"status": "UNKNOWN", "part": None, "description": "", "confidence": 0, "raw": ""}
 
-- If you are NOT SURE (confidence < 80) or you don't know, respond exactly:
-  UNKNOWN|Reference not found|CONFIDENCE|0
+    # Default result
+    result = {"status": "UNKNOWN", "part": None, "description": "", "confidence": 0, "raw": raw}
 
-Important:
-- Do NOT output any other text.
-- Do NOT output tokens like VALID|, SUGGESTION| etc.
-- If you reference brand/model in the answer, prefer the provided brand/model info.
-"""
-
-    result = call_deepseek_api(prompt, max_tokens=120)
-    if not result:
-        return {"status": "UNKNOWN", "part": None, "description": "", "confidence": 0, "raw": result}
-
-    raw = result.strip()
-
-    # parse in a defensive way
-    parts = [p.strip() for p in raw.split('|') if p is not None]
-    # Expected patterns:
-    # ['PART', '<part_name>', '<short_description>', 'CONFIDENCE', '95']
-    # OR ['UNKNOWN', 'Reference not found', 'CONFIDENCE', '0']
     try:
-        if len(parts) >= 5 and parts[0].upper() == 'PART':
-            # flexible parse: last token might be confidence or parts[-2]=='CONFIDENCE'
-            # prefer to find an integer at the end
-            conf = None
-            try:
-                conf = int(parts[-1])
-            except:
-                # try parts[-2] label
-                if parts[-2].upper() == 'CONFIDENCE':
-                    try:
-                        conf = int(parts[-1])
-                    except:
-                        conf = 0
-            if conf is None:
-                conf = 0
-            name = parts[1]
-            desc = " | ".join(parts[2:-2]) if len(parts) > 4 else parts[2]
-            if conf >= 80:
-                return {"status": "PART", "part": name, "description": desc, "confidence": conf, "raw": raw}
-            else:
-                return {"status": "UNKNOWN", "part": None, "description": "", "confidence": conf, "raw": raw}
-        elif len(parts) >= 3 and parts[0].upper() == 'UNKNOWN':
-            # safe unknown
-            return {"status": "UNKNOWN", "part": None, "description": "", "confidence": 0, "raw": raw}
-    except Exception as e:
-        print("Error parsing DeepSeek response:", e, raw)
+        if "### Identification" in raw:
+            # Extract key fields
+            part_name_match = re.search(r"\*\*Part Name:\*\* (.+)", raw)
+            desc_match = re.search(r"\*\*Description:\*\* (.+)", raw)
 
-    # if format didn't match, treat as unknown (safe)
-    return {"status": "UNKNOWN", "part": None, "description": "", "confidence": 0, "raw": raw}
+            if part_name_match:
+                result["part"] = part_name_match.group(1).strip()
+                result["status"] = "PART"
+
+            if desc_match:
+                result["description"] = desc_match.group(1).strip()
+
+            # Confidence heuristic
+            if "| Manufacturer | Part Number |" in raw:
+                result["confidence"] = 90
+            else:
+                result["confidence"] = 70
+    except Exception as e:
+        print("DeepSeek parse error:", e, raw)
+
+    return result
+
+VALID_PART_KEYWORDS = [
+    "brake", "filter", "clutch", "alternator", "belt", "pump", "injector",
+    "radiator", "suspension", "mirror", "light", "headlamp", "shock",
+    "bearing", "piston", "valve", "gasket", "sensor", "turbo"
+]
+
+def is_valid_part_name(name: str) -> bool:
+    n = name.lower()
+    return any(kw in n for kw in VALID_PART_KEYWORDS)
+
+
 def validate_and_correct_reference(reference: str, brand: str = "", model: str = ""):
-    """
-    Check DB first for reference. If not found, call strict DeepSeek lookup.
-    Returns:
-      - if DB found: {"status":"VALID","source":"DB","results": [...]}
-      - if DeepSeek found: {"status":"PART","source":"DeepSeek","part": "...", "description":"...", "confidence": int}
-      - otherwise: {"status":"UNKNOWN", "source":"DeepSeek"}
-    """
     reference = reference.strip()
-    # 1) DB lookup (uses the improved search_products)
+
     db_results = search_products(reference=reference)
     if db_results:
         return {"status": "VALID", "source": "DB", "results": db_results}
 
-    # 2) DeepSeek fallback (strict)
     ds = deepseek_reference_lookup(reference, brand, model)
     if ds["status"] == "PART":
         return {
@@ -546,8 +542,10 @@ def validate_and_correct_reference(reference: str, brand: str = "", model: str =
             "raw": ds.get("raw")
         }
 
-    # 3) unknown
+    # ✅ fallback
     return {"status": "UNKNOWN", "source": "DeepSeek"}
+
+
 
 def process_message(message, session):
     """Process user message with enhanced AI validation"""
@@ -668,30 +666,25 @@ def process_message(message, session):
     
     # Ask for reference
     elif state == 'ask_reference':
-        reference_input = message.strip().upper()
-        session['temp_data']['reference'] = reference_input
+        reference_input = message.strip()
+        # keep original form for display but normalize for searching
+        display_ref = reference_input.upper()
+        session['temp_data']['reference'] = display_ref
 
-        # sanitize brand/model values (avoid passing wrong types into prompts)
-        brand_val = session.get('brand') or ""
-        if isinstance(brand_val, (list, tuple)):
-            brand_val = brand_val[1] if len(brand_val) > 1 else brand_val[0]
-        brand_val = str(brand_val)
+        brand_val = sanitize_session_value(session.get('brand'))
+        model_val = sanitize_session_value(session.get('model'))
 
-        model_val = session.get('model') or ""
-        if isinstance(model_val, (list, tuple)):
-            model_val = model_val[1] if len(model_val) > 1 else model_val[0]
-        model_val = str(model_val)
-
-        # 1) DB-first search (normalized)
+        # 1) DB-first search (search_products should handle normalized refs)
         products = search_products(reference=reference_input)
 
         if products:
+            
             product = products[0]
             session['temp_data']['product'] = product
             session['state'] = 'confirm_reference'
             response['reply'] = (
                 f"✅ **Found in our catalog!**\n\n"
-                f"📋 **Reference**: {reference_input}\n"
+                f"📋 **Reference**: {display_ref}\n"
                 f"🚗 **Vehicle**: {brand_val} {model_val}\n"
                 f"🔧 **Part**: {product.get('product_name')}\n"
                 f"📝 **Description**: {product.get('product_description')}\n\n"
@@ -700,32 +693,79 @@ def process_message(message, session):
             response['suggestions'] = ['Yes', 'No']
             response['type'] = 'parts'
             response['data'] = products[:3]
+            return response
+
+        # 2) If DB empty -> strict external lookup
+        ds = validate_and_correct_reference(reference_input, brand=brand_val, model=model_val)
+        session['temp_data'].pop('product', None)  # ensure no stale product
+        session['state'] = 'confirm_reference'
+
+        if ds.get('status') == 'PART':
+            response['reply'] = (
+                f"📋 **Reference**: {display_ref}\n"
+                f"🚗 **Vehicle**: {brand_val} {model_val}\n"
+                f"🔧 **Part Type (external lookup)**: {ds.get('part')}\n"
+                f"📝 **Description**: {ds.get('description')}\n"
+                f"{ds.get('raw')}\n\n"
+                f"⚠️ Confidence: {ds.get('confidence')}%\n\n"
+                "Is this the correct reference?"
+            )
+            response['suggestions'] = ['Yes', 'No']
         else:
-            # 2) Strict DeepSeek fallback
-            ds = validate_and_correct_reference(reference_input, brand=brand_val, model=model_val)
-            session['state'] = 'confirm_reference'
-            if ds.get('status') == 'PART':
-                # Use the AI result but mark clearly as an external lookup with confidence
+            response['reply'] = (
+                f"📋 **Reference**: {display_ref}\n"
+                f"🚗 **Vehicle**: {brand_val} {model_val}\n\n"
+                "❌ I couldn't find a confident match for this reference.\n"
+                "Would you like to provide the part name or leave your phone so our agents can help?"
+            )
+            response['suggestions'] = ['Provide Part Name', 'Share Phone']
+        return response
+
+
+    elif state == 'confirm_reference':
+        m = message.strip().lower()
+        yes_re = re.compile(r'\b(yes|y|oui|si|ok|confirm|sure)\b')
+        no_re  = re.compile(r'\b(no|n|non|cancel|wrong|not)\b')
+
+        if yes_re.search(m):
+            # Confirmed by user
+            session['reference'] = session['temp_data'].get('reference')
+            product = session['temp_data'].get('product')
+
+            if product:
+                session['found'] = True
+                # DB product found -> proceed to order
+                price = product.get('sales_price', 0)
+                session['state'] = 'ask_order'
                 response['reply'] = (
-                    f"📋 **Reference**: {reference_input}\n"
-                    f"🚗 **Vehicle**: {brand_val} {model_val}\n"
-                    f"🔧 **Part Type (external lookup)**: {ds.get('part')}\n"
-                    f"📝 **Description**: {ds.get('description')}\n"
-                    f"⚠️ Confidence: {ds.get('confidence')}%\n\n"
-                    "Is this the correct reference?"
+                    f"📦 **Part**: {product.get('product_name')}\n"
+                    f"💰 **Price**: {price} DZD\n\n"
+                    f"**Would you like to order now?**"
                 )
-                response['suggestions'] = ['Yes', 'No']
+                response['type'] = 'parts'
+                response['data'] = [product]
+                response['suggestions'] = ['Order Now', 'Continue Shopping']
             else:
-                # Safe: unknown — don't show random guesses
-                response['reply'] = (
-                    f"📋 **Reference**: {reference_input}\n"
-                    f"🚗 **Vehicle**: {brand_val} {model_val}\n\n"
-                    "❌ I couldn't find a confident match for this reference.\n"
-                    "Would you like to provide the part name or leave your phone so our agents can help?"
-                )
-                response['suggestions'] = ['Provide Part Name', 'Share Phone']
+                session['found'] = False
+                # External lookup accepted by user -> ask contact info (no DB product to order)
+                session['state'] = 'ask_contact'
+                response['reply'] = "📱 Please share your phone number so one of our agents can assist you:"
+                response['suggestions'] = []
+            save_conversation_data(session)
+            return response
 
+        elif no_re.search(m):
+            # User says no -> explicitly ask for the reference again
+            session['state'] = 'ask_reference'
+            session['temp_data'] = {}
+            response['reply'] = "**No worries.** Please re-enter the correct reference number:"
+            response['suggestions'] = []
+            return response
 
+        else:
+            response['reply'] = "Please reply with 'Yes' or 'No'."
+            response['suggestions'] = ['Yes', 'No']
+            return response
 
     
     # Ask for part name
@@ -757,6 +797,7 @@ def process_message(message, session):
             )
 
             if products:
+                session['found'] = True
                 # ✅ Found in DB → show details + order
                 product = products[0]
                 price = product.get('sales_price', 0)
@@ -771,6 +812,7 @@ def process_message(message, session):
                 response['data'] = products[:3]
                 response['suggestions'] = ['Order Now', 'Continue Shopping']
             else:
+                session['found'] = False
                 # ❌ Not in DB → ask for contact directly (no mention of missing part)
                 session['state'] = 'ask_contact'
                 response['reply'] = (
@@ -961,6 +1003,21 @@ def db_lookup_spare_part(user_input: str):
     finally:
         cur.close()
         conn.close()
+        
+        
+def sanitize_session_value(val):
+    """Return a clean single string from session values that may contain AI tokens
+    or lists/tuples. E.g. 'BMW, SUGGESTION|BMW...' -> 'BMW'."""
+    if not val:
+        return ""
+    if isinstance(val, (list, tuple)):
+        # prefer first element (usually the human-friendly one)
+        val = val[0] if len(val) > 0 else ""
+    v = str(val).strip()
+    # remove any AI token fragments or trailing commas after first clean token
+    # split on '|' or ',' and take first non-empty part
+    parts = [p.strip() for p in re.split(r'[\|,]', v) if p.strip()]
+    return parts[0] if parts else v
 
 @app.route('/')
 def index():
