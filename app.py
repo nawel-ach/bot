@@ -276,21 +276,85 @@ KNOWN_BRANDS = {
     'seat', 'opel', 'vauxhall', 'volvo', 'jaguar', 'land rover',
     'tesla', 'byd', 'nio', 'xpeng', 'great wall', 'geely', 'chery'
 }
-def validate_and_correct_brand(user_input):
-    # 1) DB-first
-    exact_or_best, _ = db_lookup_brand(user_input)
-    if exact_or_best:
-        # If we found something in our DB inventory, consider it VALID immediately
-        return 'VALID', exact_or_best
 
-    # 2) Fallback to DeepSeek only if DB had nothing
-    prompt = f"Is '{user_input}' a valid car brand? Respond ONLY in format: VALID|exact_name, SUGGESTION|corrected_name, INVALID|unknown"
-    result = call_deepseek_api(prompt, max_tokens=50)
-    if result and '|' in result:
-        status, brand = result.split('|', 1)
-        return status.strip().upper(), brand.strip()
-    # Final fallback: treat as suggestion = user input (don’t block flow)
-    return 'SUGGESTION', user_input.strip()
+
+
+
+def validate_and_correct_brand_model_year(user_input: str):
+    """
+    Extract brand, model, and year from user input.
+    Supports English, French, Arabic, and free-form sentences.
+    Prioritizes DB lookup, fallback to DeepSeek with strict schema.
+    Returns: (status, brand, model, year)
+    """
+    raw_input = user_input.strip()
+
+    # --- 1) DB lookup first ---
+    # Try to find a brand inside input
+    for known_brand in KNOWN_BRANDS:
+        if known_brand.lower() in raw_input.lower():
+            brand = known_brand.title()
+            # Try to get model for this brand
+            models = get_known_models_for_brand(brand)
+            for model in models:
+                if model.lower() in raw_input.lower():
+                    # Extract year if present (only valid 1950-2025)
+                    year_match = re.search(r'(19[5-9]\d|20[0-2]\d|2025)', raw_input)
+                    year_val = int(year_match.group()) if year_match else None
+                    return "VALID", brand, model, year_val
+
+    # --- 2) Fallback: DeepSeek strict extraction ---
+    prompt = f"""
+    Act as an automotive assistant AI.
+    The user said: "{raw_input}"
+
+    Task: Identify the vehicle brand, model, and year.
+    - Brand must be an official automotive manufacturer (global knowledge, e.g., Toyota, Peugeot, مرسيدس, رينو, بي ام دبليو).
+    - Model must be the vehicle's commercial model (e.g., Corolla, 3008, C200).
+    - Year must be between 1950 and 2025 if present.
+    - Support English, French, Arabic, or mixed sentences.
+    - If unsure, suggest the closest valid values.
+
+    Respond ONLY in this exact format:
+    VALID|<brand>|<model>|<year or NONE>
+    SUGGESTION|<brand>|<model>|<year or NONE>
+    INVALID|unknown|unknown|unknown
+
+    Examples:
+    Input: "Hello, I need Peugeot 3008 2019"
+    Output: VALID|Peugeot|3008|2019
+
+    Input: "مرسيدس سي 200 موديل 2015"
+    Output: VALID|Mercedes-Benz|C200|2015
+
+    Input: "I want Honda"
+    Output: SUGGESTION|Honda|unknown|NONE
+    """
+
+    result = call_deepseek_api(prompt, max_tokens=80)
+    if not result:
+        return "INVALID", None, None, None
+
+    parts = [p.strip() for p in result.split("|")]
+    if len(parts) < 4:
+        return "INVALID", None, None, None
+
+    status, brand, model, year_str = parts[0].upper(), parts[1], parts[2], parts[3]
+
+    # Normalize year
+    year_val = None
+    if year_str and year_str not in ("NONE", "UNKNOWN"):
+        try:
+            year_val = int(year_str)
+            if not (1950 <= year_val <= 2025):
+                year_val = None
+        except:
+            year_val = None
+
+    # Final return
+    return status, brand if brand != "unknown" else None, model if model != "unknown" else None, year_val
+
+
 
 def get_known_models_for_brand(brand):
     """Fetch all known models for a brand from the database"""
@@ -312,29 +376,7 @@ def get_known_models_for_brand(brand):
     finally:
         cur.close()
         conn.close()
-def validate_and_correct_model(user_input, brand):
-    """Hybrid model validation: DB + Fuzzy + AI"""
-    user_input = user_input.strip()
 
-    # Step 1: Get known models from DB
-    known_models = get_known_models_for_brand(brand)
-    if not known_models:
-        # If no models in DB, fall back to AI
-        status, model = call_deepseek_model_validation(user_input, brand)
-        return status, model
-
-    # Step 2: Fuzzy match
-    matches = process.extract(user_input, known_models, scorer=fuzz.WRatio, limit=3)
-    best_match, score = matches[0]
-
-    if score >= 90:  # High confidence direct match
-        return 'VALID', best_match
-    elif score >= 75:  # Likely typo
-        return 'SUGGESTION', best_match
-    else:
-        # Not found locally — use AI to check global knowledge
-        status, model = call_deepseek_model_validation(user_input, brand)
-        return status, model
 
 def call_deepseek_model_validation(user_input, brand):
     """Call DeepSeek only when DB fails"""
@@ -350,46 +392,74 @@ def call_deepseek_model_validation(user_input, brand):
         status, model = result.split('|', 1)
         return status.strip().upper(), model.strip()
     return 'SUGGESTION', user_input
-def validate_and_correct_spare_part(user_input):
+def validate_and_correct_spare_part(user_input: str):
+    """
+    Validate and normalize spare part names (multi-language: EN, FR, AR).
+    Returns: (status, part_name)
+    - status: VALID | SUGGESTION | INVALID
+    - part_name: Clean corrected spare part name
+    """
     user_input = user_input.strip()
 
-    # 1) DB-first lookup
+    # --- 1) DB-first lookup ---
     exact_or_best, candidates = db_lookup_spare_part(user_input)
     if exact_or_best:
-        return 'VALID', exact_or_best
+        return "VALID", exact_or_best.title()
 
-    # 2) Check common variants
+    # --- 2) Common multilingual variants ---
     common_parts = {
-        'brake pad': ['brake pads', 'break pad', 'break pads'],
-        'oil filter': ['oil filt', 'oill filter'],
-        'alternator': ['alternatr', 'alternator generator'],
-        'timing belt': ['timeing belt', 'cam belt'],
-        'spark plug': ['spark plugs'],
-        'windshield': ['front glass', 'wind screen']
+        "brake pads": ["brake pad", "plaquette de frein", "فرامل", "break pads"],
+        "oil filter": ["filtre à huile", "oil filt", "فلتر زيت"],
+        "air filter": ["filtre à air", "فلتر هواء"],
+        "fuel filter": ["filtre à carburant", "فلتر وقود"],
+        "alternator": ["alternatr", "alternator generator", "alternateur", "الدينامو"],
+        "timing belt": ["courroie de distribution", "timeing belt", "cam belt", "سير الكاتينة"],
+        "spark plug": ["spark plugs", "bougie d’allumage", "شمعة"],
+        "windshield": ["pare-brise", "front glass", "wind screen", "زجاج أمامي"],
+        "clutch kit": ["kit embrayage", "طقم دبرياج"]
     }
 
+    lower_in = user_input.lower()
     for correct, variants in common_parts.items():
-        if user_input.lower() == correct or user_input.lower() in variants:
-            return 'VALID', correct.title()
-        if fuzz.WRatio(user_input, correct) > 85:
-            return 'SUGGESTION', correct.title()
+        if lower_in == correct or lower_in in variants:
+            return "VALID", correct.title()
+        if fuzz.WRatio(lower_in, correct) > 87:
+            return "SUGGESTION", correct.title()
 
-    # 3) Fuzzy match against DB candidates
+    # --- 3) Fuzzy match against DB candidates ---
     if candidates:
         matches = process.extract(user_input, candidates, scorer=fuzz.WRatio, limit=1)
         best_match, score = matches[0]
-        if score >= 85:
-            return 'SUGGESTION', best_match
+        if score >= 88:
+            return "SUGGESTION", best_match.title()
 
-    # 4) Fallback to AI
-    prompt = f"User said '{user_input}'. Is this a car spare part? Respond: VALID|name, SUGGESTION|name"
-    result = call_deepseek_api(prompt, max_tokens=50)
-    if result and '|' in result:
-        status, part = result.split('|', 1)
-        return status.strip().upper(), part.strip()
+    # --- 4) Fallback: DeepSeek strict check ---
+    prompt = f"""
+    You are an expert automotive spare-parts assistant.
+    User input: "{user_input}"
 
-    return 'SUGGESTION', user_input.title()
+    Task:
+    - Identify if this is a car spare part.
+    - If yes: Respond ONLY as "VALID|<clean part name>"
+    - If it's unclear but close: "SUGGESTION|<corrected part name>"
+    - If not a part: "INVALID|unknown"
 
+    Rules:
+    - Output must be a single line with exactly one '|'.
+    - The part name must be short and clean (e.g., "Brake Pads", "Oil Filter").
+    - Do not include brand, model, or extra details.
+    """
+
+    result = call_deepseek_api(prompt, max_tokens=40)
+    if result and "|" in result:
+        try:
+            status, part = result.split("|", 1)
+            return status.strip().upper(), part.strip().title()
+        except:
+            pass
+
+    # --- 5) Last fallback: return as suggestion ---
+    return "SUGGESTION", user_input.title()
 
 
 
@@ -434,84 +504,7 @@ def search_products(brand=None, model=None, spare_part=None, reference=None):
         cur.close()
         conn.close()
         
-spare_part_assistant_prompt = """
-Role: You are a "Spare Part Cross-Reference Expert", a specialized AI that identifies spare parts and finds their equivalent references across different manufacturers.
 
-Core Function: When provided a single part number, you must perform a two-step analysis:
-1.  **Identification:** Determine the exact common name, manufacturer, and function of the provided part number.
-2.  **Cross-Referencing:** Find the most common equivalent part numbers from other major manufacturers.
-
-Process & Rules:
-- **Accuracy Over Guesswork:** If a number is ambiguous or you have low confidence, you MUST state this clearly. Do not hallucinate information.
-- **Focus on Major Brands:** Prioritize equivalents from top OEM and aftermarket brands (e.g., Bosch, Mann-Filter, Mahle, Gates, NGK, Lemförder, Corteco, SKF, Febi Bilstein).
-- **Hierarchical Lookup:** First, identify the part. Then, find its direct equivalents. If a direct equivalent isn't known, you may list parts that are functionally equivalent for the same application.
-- **Supersession:** Always check if the provided number has been superseded by a newer number from the same manufacturer and note it.
-
-Input Format: The user will provide input as: [part number]
-Example: 0 242 235 653 or A0004209900
-
-Output Format: You MUST respond using the following exact markdown template. Do not deviate.
-
-### Identification
-- **Provided Reference:** [Input Number]
-- **Manufacturer:** [Primary Manufacturer]
-- **Part Name:** [Common Name]
-- **Description:** [One-sentence function description]
-- **Common Application:** [E.g., "VW Golf Mk7 1.8T TSI", "BMW E90 330i"]
-- **Note:** [Supersession or ambiguity note]
-
-### Common Equivalent References
-| Manufacturer | Part Number | Note |
-| :--- | :--- | :--- |
-| [Manufacturer Name] | [Equivalent Number] | [e.g., "Direct OEM equivalent"] |
-| [Manufacturer Name] | [Equivalent Number] | [e.g., "Aftermarket equivalent"] |
-| [Manufacturer Name] | [Equivalent Number] | [e.g., "Supersedes the provided number"] |
-
-**Disclaimer:** *These cross-references are for informational purposes only. Always verify part number compatibility with a professional before purchase.*
-
-Error Handling:
-- If the number is invalid: "Error: Could not identify a part for reference [number]. Please verify the number for typos."
-- If input is unclear: "Error: Input is ambiguous. Please specify the manufacturer or product category (e.g., 'automotive brake pad')."
-
-Now, analyze the following part number:
-"""
-
-def deepseek_reference_lookup(reference: str, brand: str = "", model: str = ""):
-    """
-    Uses strict spare part assistant prompt to identify and cross-reference a part number.
-    Returns structured dict.
-    """
-    prompt = spare_part_assistant_prompt + f"\n{reference}\n"
-
-    raw = call_deepseek_api(prompt, max_tokens=400)
-    if not raw:
-        return {"status": "UNKNOWN", "part": None, "description": "", "confidence": 0, "raw": ""}
-
-    # Default result
-    result = {"status": "UNKNOWN", "part": None, "description": "", "confidence": 0, "raw": raw}
-
-    try:
-        if "### Identification" in raw:
-            # Extract key fields
-            part_name_match = re.search(r"\*\*Part Name:\*\* (.+)", raw)
-            desc_match = re.search(r"\*\*Description:\*\* (.+)", raw)
-
-            if part_name_match:
-                result["part"] = part_name_match.group(1).strip()
-                result["status"] = "PART"
-
-            if desc_match:
-                result["description"] = desc_match.group(1).strip()
-
-            # Confidence heuristic
-            if "| Manufacturer | Part Number |" in raw:
-                result["confidence"] = 90
-            else:
-                result["confidence"] = 70
-    except Exception as e:
-        print("DeepSeek parse error:", e, raw)
-
-    return result
 
 VALID_PART_KEYWORDS = [
     "brake", "filter", "clutch", "alternator", "belt", "pump", "injector",
@@ -525,25 +518,30 @@ def is_valid_part_name(name: str) -> bool:
 
 
 def validate_and_correct_reference(reference: str, brand: str = "", model: str = ""):
+    """
+    Validate reference number:
+    - If in DB → return its product name(s).
+    - If not → directly ask for phone number (no DeepSeek fallback, no guessing).
+    """
     reference = reference.strip()
 
+    # 1) Check in DB
     db_results = search_products(reference=reference)
     if db_results:
-        return {"status": "VALID", "source": "DB", "results": db_results}
-
-    ds = deepseek_reference_lookup(reference, brand, model)
-    if ds["status"] == "PART":
+        product_names = [row["product_name"] for row in db_results if row.get("product_name")]
         return {
-            "status": "PART",
-            "source": "DeepSeek",
-            "part": ds["part"],
-            "description": ds["description"],
-            "confidence": ds["confidence"],
-            "raw": ds.get("raw")
+            "status": "VALID",
+            "source": "DB",
+            "results": product_names
         }
 
-    # ✅ fallback
-    return {"status": "UNKNOWN", "source": "DeepSeek"}
+    # 2) Not in DB → ask phone (no DeepSeek guessing)
+    return {
+        "status": "NOT_FOUND",
+        "source": "DB",
+        "message": "📱 Please provide your phone number so our agents can assist you."
+    }
+
 
 
 
@@ -555,101 +553,61 @@ def process_message(message, session):
     # Welcome state
     if state == 'welcome':
         if any(word in message.lower() for word in ['search', 'spare', 'part', 'find', 'look']):
-            session['state'] = 'ask_brand'
-            response['reply'] = "🚗 **Let's find the perfect spare part for your vehicle!**\n\n**Step 1: Vehicle Brand**\nPlease tell me your vehicle's brand (e.g., Toyota, BMW, Mercedes, Peugeot, etc.)\n\n💡 I know all car brands worldwide - just type what you have!"
+            session['state'] = 'ask_vehicle'
+            response['reply'] = (
+            "🚗 **Let's find your spare part!**\n\n"
+            "Please enter your vehicle brand, model, and year together:\n\n"
+            "💡 Examples:\n"
+            "- Toyota Corolla 2018\n"
+            "- BMW X5 2020\n"
+            "- Mercedes C200 2015"
+             )
             save_conversation_data(session)
         else:
             response['reply'] = "👋 **Welcome to IMOBOT - Your Intelligent Spare Parts Assistant!**\n\n🔧 I can help you find any spare part for any vehicle!\n\nHow can I assist you today?"
             response['suggestions'] = ['Search Parts', 'Track Order (Soon)', 'Report (Soon)']
     
     # Ask for brand
-    elif state == 'ask_brand':
-        brand_input = message.strip()
-        
-        # Use DeepSeek's full knowledge to validate brand
-        status, corrected_brand = validate_and_correct_brand(brand_input)
-        
-        if status == 'VALID':
-            session['temp_data']['brand'] = corrected_brand
-            session['state'] = 'confirm_brand'
-            response['reply'] = f"✅ **Excellent!** I found **{corrected_brand}** in my database.\n\n**Is this correct?**"
+    elif state == 'ask_vehicle':
+        v_input = message.strip()
+        status, brand, model, year = validate_and_correct_brand_model_year(v_input)
+
+        if status == "VALID":
+            session['brand'] = brand
+            session['model'] = model
+            session['year'] = year
+            session['state'] = 'ask_search_type'
+            response['reply'] = f"✅ Vehicle confirmed: **{brand} {model} {year or ''}**\n\nHow would you like to search for your spare part?"
+            response['suggestions'] = ['Search by Reference', 'Search by Part Name']
+            save_conversation_data(session)
+
+        elif status == "SUGGESTION":
+            session['temp_data']['brand'] = brand
+            session['temp_data']['model'] = model
+            session['temp_data']['year'] = year
+            session['state'] = 'confirm_vehicle'
+            response['reply'] = f"🤔 Did you mean **{brand} {model} {year or ''}**?"
             response['suggestions'] = ['Yes', 'No']
-        elif status == 'SUGGESTION':
-            session['temp_data']['brand'] = corrected_brand
-            session['state'] = 'confirm_brand'
-            response['reply'] = f"🤔 Did you mean **{corrected_brand}**?\n\n**Please confirm:**"
-            response['suggestions'] = ['Yes', 'No']
+
         else:
-            response['reply'] = f"❌ I couldn't recognize '{brand_input}' as a car brand.\n\n**Please enter a valid car brand.**\n\n💡 Examples: Toyota, BMW, Mercedes-Benz, Volkswagen, Peugeot, Renault, Hyundai, Nissan, Ford, etc."
-    
-    # Confirm brand
-    elif state == 'confirm_brand':
+            response['reply'] = (
+                f"❌ I couldn't recognize '{v_input}' as a valid vehicle.\n\n"
+                "Please enter brand, model, and year (e.g., 'Toyota Corolla 2018')."
+            )
+    elif state == 'confirm_vehicle':
         if 'yes' in message.lower():
             session['brand'] = session['temp_data']['brand']
-            session['state'] = 'ask_model'
-            response['reply'] = f"✅ **Great! {session['brand']} confirmed.**\n\n**Step 2: Vehicle Model**\nNow, what's your {session['brand']} model?\n\n💡 Just type your model name!"
+            session['model'] = session['temp_data']['model']
+            session['year'] = session['temp_data']['year']
+            session['state'] = 'ask_search_type'
+            response['reply'] = f"✅ Vehicle confirmed: **{session['brand']} {session['model']} {session['year'] or ''}**\n\nHow would you like to search?"
+            response['suggestions'] = ['Search by Reference', 'Search by Part Name']
             save_conversation_data(session)
         else:
-            session['state'] = 'ask_brand'
+            session['state'] = 'ask_vehicle'
             session['temp_data'] = {}
-            response['reply'] = "**No problem!** Let's try again.\n\n**Please enter your vehicle brand:**"
-    
-    # Ask for model
-    elif state == 'ask_model':
-        model_input = message.strip()
-        
-        # Use DeepSeek's full knowledge to validate model
-        status, corrected_model = validate_and_correct_model(model_input, session['brand'])
-        
-        if status == 'VALID':
-            session['temp_data']['model'] = corrected_model
-            session['state'] = 'confirm_model'
-            response['reply'] = f"✅ **Perfect!** {session['brand']} **{corrected_model}** found.\n\n**Is this correct?**"
-            response['suggestions'] = ['Yes', 'No']
-        elif status == 'SUGGESTION':
-            session['temp_data']['model'] = corrected_model
-            session['state'] = 'confirm_model'
-            response['reply'] = f"🤔 Did you mean {session['brand']} **{corrected_model}**?\n\n**Please confirm:**"
-            response['suggestions'] = ['Yes', 'No']
-        else:
-            response['reply'] = f"❌ I couldn't find '{model_input}' as a {session['brand']} model.\n\n**Please enter a valid {session['brand']} model:**"
-    
-    # Confirm model
-    elif state == 'confirm_model':
-        if 'yes' in message.lower():
-            session['model'] = session['temp_data']['model']
-            session['state'] = 'ask_year'
-            response['reply'] = f"? **Excellent!** {session['brand']} {session['model']} confirmed.\n\n**Step 3: Vehicle Year (Optional)**\n?? What year is your vehicle?\n?? Enter a year (e.g., 2020) or type 'skip'"
-            response['suggestions'] = ['Skip']
-            save_conversation_data(session)  # ✅ Save now
-        else:
-            session['state'] = 'ask_model'
-            session['temp_data'] = {}
-            response['reply'] = f"**No problem!** Let's try again.\n\n**Please enter your {session['brand']} model:**"
-    
-    # Ask for year
-    elif state == 'ask_year':
-        if 'skip' in message.lower():
-            session['state'] = 'ask_search_type'
-            response['reply'] = "**How would you like to search for your spare part?**\n\n🔍 Choose your search method:"
-            response['suggestions'] = ['Search by Reference', 'Search by Part Name']
-        else:
-            year_match = re.search(r'\b(19|20)\d{2}\b', message)
-            if year_match:
-                year = int(year_match.group())
-                if 1950 <= year <= 2025:
-                    session['year'] = year
-                    session['state'] = 'ask_search_type'
-                    response['reply'] = f"✅ **Year {year} noted!**\n\n**How would you like to search?**"
-                    response['suggestions'] = ['Search by Reference', 'Search by Part Name']
-                    save_conversation_data(session)
-                else:
-                    response['reply'] = "Please enter a valid year (1950-2025) or 'skip':"
-                    response['suggestions'] = ['Skip']
-            else:
-                response['reply'] = "Please enter a valid year or 'skip':"
-                response['suggestions'] = ['Skip']
-    
+            response['reply'] = "❌ No worries! Please re-enter your vehicle brand, model, and year (e.g., 'Honda Civic 2017')."
+
     # Ask search type
     elif state == 'ask_search_type':
         if 'reference' in message.lower():
@@ -667,18 +625,16 @@ def process_message(message, session):
     # Ask for reference
     elif state == 'ask_reference':
         reference_input = message.strip()
-        # keep original form for display but normalize for searching
         display_ref = reference_input.upper()
         session['temp_data']['reference'] = display_ref
 
         brand_val = sanitize_session_value(session.get('brand'))
         model_val = sanitize_session_value(session.get('model'))
 
-        # 1) DB-first search (search_products should handle normalized refs)
+        # ✅ DB-first and only
         products = search_products(reference=reference_input)
 
         if products:
-            
             product = products[0]
             session['temp_data']['product'] = product
             session['state'] = 'confirm_reference'
@@ -693,32 +649,16 @@ def process_message(message, session):
             response['suggestions'] = ['Yes', 'No']
             response['type'] = 'parts'
             response['data'] = products[:3]
-            return response
-
-        # 2) If DB empty -> strict external lookup
-        ds = validate_and_correct_reference(reference_input, brand=brand_val, model=model_val)
-        session['temp_data'].pop('product', None)  # ensure no stale product
-        session['state'] = 'confirm_reference'
-
-        if ds.get('status') == 'PART':
-            response['reply'] = (
-                f"📋 **Reference**: {display_ref}\n"
-                f"🚗 **Vehicle**: {brand_val} {model_val}\n"
-                f"🔧 **Part Type (external lookup)**: {ds.get('part')}\n"
-                f"📝 **Description**: {ds.get('description')}\n"
-                f"{ds.get('raw')}\n\n"
-                f"⚠️ Confidence: {ds.get('confidence')}%\n\n"
-                "Is this the correct reference?"
-            )
-            response['suggestions'] = ['Yes', 'No']
         else:
+            # ❌ Not in DB → skip AI lookup, ask phone immediately
+            session['state'] = 'ask_contact'
             response['reply'] = (
                 f"📋 **Reference**: {display_ref}\n"
                 f"🚗 **Vehicle**: {brand_val} {model_val}\n\n"
-                "❌ I couldn't find a confident match for this reference.\n"
-                "Would you like to provide the part name or leave your phone so our agents can help?"
+                "📱 Please provide your phone number so our agents can assist you."
             )
-            response['suggestions'] = ['Provide Part Name', 'Share Phone']
+            response['suggestions'] = []
+
         return response
 
 
@@ -728,13 +668,15 @@ def process_message(message, session):
         no_re  = re.compile(r'\b(no|n|non|cancel|wrong|not)\b')
 
         if yes_re.search(m):
-            # Confirmed by user
             session['reference'] = session['temp_data'].get('reference')
             product = session['temp_data'].get('product')
 
             if product:
                 session['found'] = True
-                # DB product found -> proceed to order
+                # ✅ Save spare part name into session (will go to DB)
+                session['spare_part'] = product.get('product_name')
+                session['spare_part_name'] = product.get('product_name')
+
                 price = product.get('sales_price', 0)
                 session['state'] = 'ask_order'
                 response['reply'] = (
@@ -746,16 +688,17 @@ def process_message(message, session):
                 response['data'] = [product]
                 response['suggestions'] = ['Order Now', 'Continue Shopping']
             else:
+                # Normally won't reach here since only DB products reach confirm_reference
                 session['found'] = False
-                # External lookup accepted by user -> ask contact info (no DB product to order)
                 session['state'] = 'ask_contact'
                 response['reply'] = "📱 Please share your phone number so one of our agents can assist you:"
                 response['suggestions'] = []
+
+            # ✅ Persist to DB (spare_part_name will now be stored)
             save_conversation_data(session)
             return response
 
         elif no_re.search(m):
-            # User says no -> explicitly ask for the reference again
             session['state'] = 'ask_reference'
             session['temp_data'] = {}
             response['reply'] = "**No worries.** Please re-enter the correct reference number:"
@@ -766,6 +709,7 @@ def process_message(message, session):
             response['reply'] = "Please reply with 'Yes' or 'No'."
             response['suggestions'] = ['Yes', 'No']
             return response
+
 
     
     # Ask for part name
@@ -1101,9 +1045,10 @@ def get_conversations():
             SELECT c.*, COUNT(m.id) as message_count
             FROM conversations c
             LEFT JOIN messages m ON c.conversation_id = m.conversation_id
-            GROUP BY c.id
+            GROUP BY c.conversation_id
             ORDER BY c.created_at DESC
             LIMIT 100
+
         ''')
         
         conversations = cur.fetchall()
@@ -1401,7 +1346,21 @@ def admin_dashboard():
                     document.getElementById('recentActivity').innerHTML = 'Error loading products';
                 }
             }
-            
+            async function loadHealth() {
+                try {
+                    const response = await fetch('/api/health');
+                    const data = await response.json();
+                    document.getElementById('systemHealth').textContent =
+                        data.database === 'connected' ? '🟢' : '🔴';
+                } catch (error) {
+                    document.getElementById('systemHealth').textContent = '⚠️';
+                }
+            }
+
+            // call it once + refresh every 30s
+            loadHealth();
+            setInterval(loadHealth, 30000);
+
             function exportData() {
                 // Simple export functionality
                 window.open('/api/conversations?format=json', '_blank');
