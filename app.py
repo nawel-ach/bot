@@ -79,11 +79,11 @@ def init_db():
             cur.execute('''
                 DO $$
                 BEGIN
-                    IF EXISTS (
-                        SELECT 1 FROM information_schema.table_constraints 
-                        WHERE constraint_name = 'messages_conversation_id_fkey'
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name='products' AND column_name='created_at'
                     ) THEN
-                        ALTER TABLE messages DROP CONSTRAINT messages_conversation_id_fkey;
+                        ALTER TABLE products ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                     END IF;
                 END$$;
             ''')
@@ -1042,12 +1042,29 @@ def get_conversations():
     try:
         # Get conversations with message counts
         cur.execute('''
-            SELECT c.*, COUNT(m.id) as message_count
-            FROM conversations c
-            LEFT JOIN messages m ON c.conversation_id = m.conversation_id
-            GROUP BY c.conversation_id
-            ORDER BY c.created_at DESC
-            LIMIT 100
+                SELECT 
+                    c.conversation_id,
+                    c.session_id,
+                    c.brand,
+                    c.model,
+                    c.year,
+                    c.spare_part_name,
+                    c.reference,
+                    c.user_phone,
+                    c.user_email,
+                    c.found,
+                    c.created_at,
+                    c.updated_at,
+                    COUNT(m.id) AS message_count
+                FROM conversations c
+                LEFT JOIN messages m ON c.conversation_id = m.conversation_id
+                GROUP BY 
+                    c.conversation_id, c.session_id, c.brand, c.model, c.year,
+                    c.spare_part_name, c.reference, c.user_phone, c.user_email,
+                    c.found, c.created_at, c.updated_at
+                ORDER BY c.created_at DESC
+                LIMIT 100;
+
 
         ''')
         
